@@ -287,6 +287,11 @@ def get_var(name, default=None):
     _State.new_transaction()
 
     if _State.vars_table_name not in list(_State.metadata.tables.keys()):
+        # Another connection (e.g. a BatchWriter engine) may have created
+        # the table since this metadata was last reflected.  Refresh once
+        # before concluding the variable does not exist.
+        _State.reflect_metadata()
+    if _State.vars_table_name not in list(_State.metadata.tables.keys()):
         return None
 
     table = sqlalchemy.Table(_State.vars_table_name, _State.metadata)

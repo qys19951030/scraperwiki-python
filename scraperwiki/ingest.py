@@ -19,6 +19,11 @@ from . import sql
 # Table holding rows that could not be written together with the reason.
 QUARANTINE_TABLE = "swquarantine"
 
+# Checkpoints live in the existing scraperwiki variable store (the same
+# table used by sql.save_var / sql.get_var), namespaced per task.
+VARS_TABLE = "swvariables"
+CHECKPOINT_PREFIX = "swingest:checkpoint:"
+
 
 class BatchWriter:
     """
@@ -65,8 +70,54 @@ class BatchWriter:
         # connection state used by the legacy scraperwiki.sql functions.
         self._engine = sql._engine_for()
 
+        # Highest batch number known to be fully written.  Loaded from the
+        # database so a writer recreated after a restart carries on where
+        # the previous run stopped.
+        self._checkpoint = self._load_checkpoint()
+
         # Cumulative counters for the lifetime of this writer.
         self._stats = {"success": 0, "failure": 0, "skipped": 0}
+
+    @property
+    def _checkpoint_var(self):
+        return CHECKPOINT_PREFIX + self.task
+
+    def _load_checkpoint(self):
+        """Read the persisted checkpoint for this task, if any."""
+        with self._engine.connect() as connection:
+            if not sql.table_exists(connection, VARS_TABLE):
+                return -1
+            row = connection.exec_driver_sql(
+                f"SELECT value_blob FROM {sql._quoted_identifier(VARS_TABLE)} "
+                "WHERE name = ?",
+                (self._checkpoint_var,),
+            ).fetchone()
+        if row is None or row[0] is None:
+            return -1
+        return int(row[0])
+
+    def _ensure_vars_table(self, connection):
+        """Make sure the variable store exists, with the legacy layout."""
+        if not sql.table_exists(connection, VARS_TABLE):
+            connection.exec_driver_sql(
+                f"CREATE TABLE {sql._quoted_identifier(VARS_TABLE)} ("
+                "name TEXT PRIMARY KEY, value_blob BLOB, type TEXT)"
+            )
+
+    def _save_checkpoint(self, connection, batch_no):
+        """
+        Record ``batch_no`` as fully written for this task.
+
+        The encoding matches sql.save_var so the value is readable through
+        sql.get_var.
+        """
+        self._ensure_vars_table(connection)
+        connection.exec_driver_sql(
+            f"INSERT OR REPLACE INTO {sql._quoted_identifier(VARS_TABLE)} "
+            "(name, value_blob, type) VALUES (?, ?, ?)",
+            (self._checkpoint_var, str(batch_no).encode("utf-8"), "big_integer"),
+        )
+        self._checkpoint = batch_no
 
     def add(self, batch_no, rows):
         """
@@ -113,6 +164,10 @@ class BatchWriter:
             for batch_no, rows in batches:
                 written = self._write_batch(connection, batch_no, rows)
                 self._stats["success"] += written
+                # The whole batch is now safely stored: advance the
+                # checkpoint inside the same transaction so a crash either
+                # commits both the rows and the progress marker or neither.
+                self._save_checkpoint(connection, batch_no)
 
     def _write_batch(self, connection, batch_no, rows):
         """Write one batch, returning the number of rows stored."""
@@ -189,7 +244,8 @@ class BatchWriter:
         """
         Highest batch number known to be fully written to the database.
 
-        ``-1`` means nothing has been written yet.  Persistent checkpoints
-        are added in a later iteration.
+        ``-1`` means nothing has been written yet.  The value is persisted
+        in the scraperwiki variable store, so a new writer for the same task
+        resumes after it.
         """
-        return -1
+        return self._checkpoint

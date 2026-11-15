@@ -222,3 +222,114 @@ class TestBatchPersistence(IngestTestCase):
             self.assertEqual(
                 conn.execute("SELECT id, v FROM things").fetchall(), [(1, "x")]
             )
+
+
+class TestCheckpoints(IngestTestCase):
+    def test_checkpoint_starts_at_minus_one(self):
+        writer = BatchWriter("task", "things", ["id"], batch_size=100)
+        self.assertEqual(writer.checkpoint, -1)
+        writer.close()
+
+    def test_checkpoint_advances_after_flush(self):
+        writer = BatchWriter("task", "things", ["id"], batch_size=100)
+        writer.add(0, [{"id": 1}])
+        writer.add(2, [{"id": 2}])
+        writer.flush()
+        self.assertEqual(writer.checkpoint, 2)
+        writer.close()
+
+    def test_checkpoint_readable_via_get_var(self):
+        with BatchWriter("task", "things", ["id"], batch_size=100) as writer:
+            writer.add(0, [{"id": 1}])
+        self.assertEqual(scraperwiki.sql.get_var("swingest:checkpoint:task"), 0)
+
+    def test_batches_at_or_below_checkpoint_are_skipped(self):
+        writer = BatchWriter("task", "things", ["id"], batch_size=100)
+        writer.add(0, [{"id": 1}, {"id": 2}])
+        writer.flush()
+        writer.add(0, [{"id": 1}, {"id": 2}])  # exact checkpoint
+        writer.add(-1, [{"id": 9}])  # below checkpoint
+        self.assertEqual(writer.pending(), 0)
+        self.assertEqual(
+            writer.stats(),
+            {"success": 2, "failure": 0, "skipped": 3},
+        )
+        self.assertEqual(self.raw_rows("things"), [(1,), (2,)])
+        writer.close()
+
+    def test_writer_resumes_after_reconstruction(self):
+        writer = BatchWriter("task", "things", ["id"], batch_size=100)
+        writer.add(0, [{"id": 1}])
+        writer.add(1, [{"id": 2}])
+        writer.close()
+
+        # Simulate a scraper restart: brand-new writer, same task name.
+        restarted = BatchWriter("task", "things", ["id"], batch_size=100)
+        self.assertEqual(restarted.checkpoint, 1)
+        # Replaying an old batch must not duplicate rows.
+        restarted.add(1, [{"id": 2}])
+        restarted.add(2, [{"id": 3}])
+        restarted.close()
+
+        self.assertEqual(restarted.stats()["skipped"], 1)
+        self.assertEqual(restarted.stats()["success"], 1)
+        self.assertEqual(self.raw_rows("things"), [(1,), (2,), (3,)])
+
+    def test_resume_works_in_a_new_process(self):
+        script = """
+            from scraperwiki.ingest import BatchWriter
+            writer = BatchWriter("task", "things", ["id"], batch_size=100)
+            writer.add(0, [{"id": 1}])
+            writer.add(1, [{"id": 2}])
+            writer.close()
+        """
+        self.run_in_subprocess(script)
+
+        script = """
+            from scraperwiki.ingest import BatchWriter
+            writer = BatchWriter("task", "things", ["id"], batch_size=100)
+            assert writer.checkpoint == 1, writer.checkpoint
+            writer.add(0, [{"id": 1}])
+            writer.add(2, [{"id": 3}])
+            writer.close()
+            assert writer.stats()["skipped"] == 1
+            assert writer.stats()["success"] == 1
+        """
+        self.run_in_subprocess(script)
+
+        self.assertEqual(self.raw_rows("things"), [(1,), (2,), (3,)])
+
+    def test_checkpoints_are_isolated_per_task(self):
+        first = BatchWriter("task-a", "things", ["id"], batch_size=100)
+        first.add(0, [{"id": 1}])
+        first.close()
+
+        second = BatchWriter("task-b", "things", ["id"], batch_size=100)
+        self.assertEqual(second.checkpoint, -1)
+        second.add(0, [{"id": 2}])
+        second.close()
+
+        recreated = BatchWriter("task-a", "things", ["id"], batch_size=100)
+        self.assertEqual(recreated.checkpoint, 0)
+        recreated.close()
+
+    def test_checkpoint_and_rows_commit_atomically(self):
+        # A flush that fails must leave neither rows nor a checkpoint
+        # behind, so a retry after restart does not skip a missing batch.
+        writer = BatchWriter("task", "things", ["id"], batch_size=100)
+        writer.add(0, [{"id": 1}, ["bad", "row"]])
+        with self.assertRaises(TypeError):
+            writer.flush()
+        writer.close()
+
+        restarted = BatchWriter("task", "things", ["id"], batch_size=100)
+        self.assertEqual(restarted.checkpoint, -1)
+        with self.raw_connect() as conn:
+            self.assertEqual(
+                conn.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type = 'table' AND name IN ('things', 'swvariables')"
+                ).fetchall(),
+                [],
+            )
+        restarted.close()
