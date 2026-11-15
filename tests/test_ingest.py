@@ -611,3 +611,99 @@ class TestLegacyInterop(IngestTestCase):
             self.raw_rows("things", order_by="id"),
             [(1, 1234), (2, "01234")],
         )
+
+
+class TestValueAndCheckpointEdgeCases(IngestTestCase):
+    def test_dates_are_stored_as_iso_text(self):
+        import datetime
+
+        day = datetime.date(2020, 1, 2)
+        moment = datetime.datetime(2020, 1, 2, 3, 4, 5)
+        with BatchWriter("task", "things", ["id"], batch_size=100) as writer:
+            writer.add(0, [{"id": 1, "day": day, "moment": moment}])
+        with self.raw_connect() as conn:
+            self.assertEqual(
+                conn.execute("SELECT day, typeof(day), moment FROM things").fetchall(),
+                [("2020-01-02", "text", "2020-01-02 03:04:05")],
+            )
+
+    def test_bytes_and_bool_round_trip_storage_classes(self):
+        with BatchWriter("task", "things", ["id"], batch_size=100) as writer:
+            writer.add(0, [{"id": 1, "blob": b"raw", "flag": True, "ratio": 1.5}])
+        with self.raw_connect() as conn:
+            self.assertEqual(
+                conn.execute(
+                    "SELECT blob, typeof(blob), flag, typeof(flag), "
+                    "ratio, typeof(ratio) FROM things"
+                ).fetchall(),
+                [(b"raw", "blob", 1, "integer", 1.5, "real")],
+            )
+
+    def test_checkpoint_only_moves_forward(self):
+        writer = BatchWriter("task", "things", ["id"], batch_size=100)
+        writer.add(5, [{"id": 1}])
+        writer.flush()
+        # An older batch arriving later is already below the checkpoint, so
+        # it is skipped and never lowers the resume boundary.
+        writer.add(2, [{"id": 2}])
+        writer.flush()
+        self.assertEqual(writer.checkpoint, 5)
+        self.assertEqual(writer.stats()["skipped"], 1)
+        writer.close()
+
+        restarted = BatchWriter("task", "things", ["id"], batch_size=100)
+        self.assertEqual(restarted.checkpoint, 5)
+        # Only batch 5's row exists; batch 2 was never written.
+        self.assertEqual(self.raw_rows("things", order_by="id"), [(1,)])
+        restarted.close()
+
+    def test_save_checkpoint_refuses_to_go_backwards(self):
+        writer = BatchWriter("task", "things", ["id"], batch_size=100)
+        with writer._engine.begin() as connection:
+            writer._save_checkpoint(connection, 5)
+            writer._save_checkpoint(connection, 2)
+        self.assertEqual(writer.checkpoint, 5)
+        writer.close()
+
+    def test_close_releases_engine_even_when_flush_fails(self):
+        writer = BatchWriter("task", "things", ["id"], batch_size=100)
+        writer.add(0, [{"id": 1}])
+
+        def boom(connection, batch_no):
+            raise RuntimeError("flush failure")
+
+        writer._save_checkpoint = boom
+        with self.assertRaises(RuntimeError):
+            writer.close()
+        self.assertTrue(writer._closed)
+        with self.assertRaises(RuntimeError):
+            writer.add(1, [{"id": 2}])
+
+    def test_empty_batch_only_records_checkpoint(self):
+        writer = BatchWriter("task", "things", ["id"], batch_size=100)
+        writer.add(0, [])
+        # No rows means nothing is buffered or flushed yet.
+        self.assertEqual(writer.pending(), 0)
+        self.assertEqual(writer.checkpoint, -1)
+        # A subsequent explicit flush with the empty batch still pending
+        # records progress without creating a data table.
+        writer._pending.append((0, []))
+        writer.flush()
+        self.assertEqual(writer.stats()["success"], 0)
+        self.assertEqual(writer.checkpoint, 0)
+        writer.close()
+        with self.raw_connect() as conn:
+            self.assertEqual(
+                conn.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' AND name='things'"
+                ).fetchall(),
+                [],
+            )
+            self.assertEqual(
+                conn.execute(
+                    "SELECT value_blob FROM swvariables "
+                    "WHERE name = 'swingest:checkpoint:task'"
+                ).fetchall(),
+                [(b"0",)],
+            )

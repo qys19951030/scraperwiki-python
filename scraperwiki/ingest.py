@@ -12,6 +12,7 @@ the batch.
 Only SQLite is supported and no new runtime dependencies are required.
 """
 
+import datetime
 import json
 from collections.abc import Mapping
 
@@ -131,8 +132,11 @@ class BatchWriter:
         Record ``batch_no`` as fully written for this task.
 
         The encoding matches sql.save_var so the value is readable through
-        sql.get_var.
+        sql.get_var.  The checkpoint only moves forward: batches flushed out
+        of order must not lower it.
         """
+        if batch_no <= self._checkpoint:
+            return
         self._ensure_vars_table(connection)
         connection.exec_driver_sql(
             f"INSERT OR REPLACE INTO {sql._quoted_identifier(VARS_TABLE)} "
@@ -217,7 +221,7 @@ class BatchWriter:
                         sql._quoted_identifier(column) for column in columns
                     )
                     placeholders = ", ".join("?" for _ in columns)
-                    values = [row[column] for column in columns]
+                    values = [self._adapt_value(row[column]) for column in columns]
                     connection.exec_driver_sql(
                         insert_sql + f"({column_sql}) VALUES ({placeholders})",
                         tuple(values),
@@ -228,6 +232,23 @@ class BatchWriter:
             else:
                 written += 1
         return written
+
+    def _adapt_value(self, value):
+        """
+        Convert a value into something pysqlite can bind directly.
+
+        Dates and datetimes become ISO strings, matching the textual storage
+        used by the legacy ``sql.save`` path and avoiding pysqlite's
+        deprecated default adapters.  Everything else (str, int, float,
+        bool, bytes, None) is passed through so its storage class survives.
+        Nested containers cannot be stored and fail the bind, which routes
+        the row to the quarantine table.
+        """
+        if isinstance(value, datetime.datetime):
+            return value.isoformat(sep=" ")
+        if isinstance(value, datetime.date):
+            return value.isoformat()
+        return value
 
     def _serialize_row(self, row):
         """Render an arbitrary row object as text for the quarantine table."""
@@ -251,7 +272,9 @@ class BatchWriter:
     def _quarantine(self, connection, batch_no, row, exc):
         """Record an unwritable row and the reason it failed."""
         self._ensure_quarantine_table(connection)
-        reason = f"{type(exc).__name__}: {exc}"
+        original = getattr(exc, "orig", None)
+        detail = str(original) if original is not None else str(exc)
+        reason = f"{type(exc).__name__}: {detail}"
         connection.exec_driver_sql(
             f"INSERT INTO {sql._quoted_identifier(QUARANTINE_TABLE)} "
             "(task, batch_no, row_content, reason) VALUES (?, ?, ?, ?)",
@@ -323,9 +346,11 @@ class BatchWriter:
         """Flush any remaining rows and release database resources."""
         if self._closed:
             return
-        self.flush()
-        self._engine.dispose()
-        self._closed = True
+        try:
+            self.flush()
+        finally:
+            self._engine.dispose()
+            self._closed = True
 
     def __enter__(self):
         return self

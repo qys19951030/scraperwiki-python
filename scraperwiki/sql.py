@@ -432,7 +432,6 @@ def get_column_type(column_value):
 # Names of the SQLite storage affinities used when a column is created or
 # rebuilt.  BLOB columns have no type affinity, which is what lets a single
 # column store integers and strings side by side without coercion.
-_TEXT_AFFINITY = "TEXT"
 _BLOB_AFFINITY = "BLOB"
 
 
