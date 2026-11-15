@@ -387,6 +387,32 @@ class TestUnicodeColumns(DBTestCase):
         scraperwiki.sqlite.save(data={"i": 2, "a\xa0b": 2}, unique_keys=["i"])
 
 
+class TestFlush(DBTestCase):
+    def test_flush_commits_buffered_rows(self):
+        scraperwiki.sql.save(["id"], {"id": 1, "v": "x"}, table_name="flushtest")
+        # The save is still held in the open legacy transaction.
+        connection = sqlite3.connect(DB_NAME, timeout=0.1)
+        self.assertEqual(connection.execute("SELECT * FROM flushtest").fetchall(), [])
+        connection.close()
+
+        scraperwiki.sql.flush()
+
+        connection = sqlite3.connect(DB_NAME, timeout=0.1)
+        self.assertEqual(
+            connection.execute("SELECT * FROM flushtest").fetchall(), [(1, "x")]
+        )
+        connection.close()
+
+    def test_flush_without_prior_activity(self):
+        # Must not raise when no connection has been opened yet.
+        scraperwiki.sql.flush()
+        scraperwiki.sql.flush()
+
+    def test_flush_is_callable_as_documented(self):
+        # The README documents sql.flush(); it used to raise AttributeError.
+        self.assertTrue(callable(scraperwiki.sql.flush))
+
+
 class TestImports(TestCase):
     "Test that all module contents are imported."
 

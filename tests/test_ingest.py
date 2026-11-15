@@ -391,3 +391,223 @@ class TestQuarantine(IngestTestCase):
             writer.add(0, ["bad-b"])
         rows = self.quarantine_rows()
         self.assertEqual([row[0] for row in rows], ["task-a", "task-b"])
+
+
+class TestTypeAdaptation(IngestTestCase):
+    def test_string_with_leading_zero_round_trips(self):
+        with BatchWriter("task", "things", ["id"], batch_size=100) as writer:
+            writer.add(0, [{"id": 1, "code": 1234}])
+            writer.flush()
+            writer.add(1, [{"id": 2, "code": "01234"}])
+        self.assertEqual(
+            self.raw_rows("things", order_by="id"),
+            [(1, 1234), (2, "01234")],
+        )
+        # A fresh sqlite3 connection must see the original storage classes.
+        with self.raw_connect() as conn:
+            self.assertEqual(
+                conn.execute(
+                    "SELECT code, typeof(code) FROM things ORDER BY id"
+                ).fetchall(),
+                [(1234, "integer"), ("01234", "text")],
+            )
+
+    def test_type_change_preserves_history_and_index(self):
+        # Table born with a typed (INTEGER) column and a unique index, as
+        # produced by the legacy sql.save path.
+        with self.raw_connect() as conn:
+            conn.execute("CREATE TABLE things (id INTEGER, code INTEGER)")
+            conn.execute("CREATE UNIQUE INDEX things_id_unique ON things(id)")
+            conn.execute("INSERT INTO things VALUES (1, 1234)")
+            conn.execute("INSERT INTO things VALUES (2, 5678)")
+
+        with BatchWriter("task", "things", ["id"], batch_size=100) as writer:
+            writer.add(0, [{"id": 3, "code": "01234"}])
+
+        # Historical integer rows survive untouched and the new string
+        # reads back verbatim.
+        self.assertEqual(
+            self.raw_rows("things", order_by="id"),
+            [(1, 1234), (2, 5678), (3, "01234")],
+        )
+        with self.raw_connect() as conn:
+            affinities = {
+                row[1]: row[2]
+                for row in conn.execute("PRAGMA table_info(things)").fetchall()
+            }
+            self.assertEqual(affinities, {"id": "BLOB", "code": "BLOB"})
+            indices = conn.execute("PRAGMA index_list(things)").fetchall()
+            self.assertTrue(
+                any(row[1] == "things_id_unique" and row[2] == 1 for row in indices),
+                indices,
+            )
+            # The unique index still blocks duplicate keys.
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute("INSERT INTO things (id, code) VALUES (3, 'x')")
+
+    def test_rebuilt_table_survives_a_further_type_change(self):
+        with self.raw_connect() as conn:
+            conn.execute("CREATE TABLE things (id INTEGER, v INTEGER)")
+            conn.execute("INSERT INTO things VALUES (1, 10)")
+        with BatchWriter("task", "things", ["id"], batch_size=100) as writer:
+            writer.add(0, [{"id": 2, "v": "11"}])
+            writer.flush()
+            writer.add(1, [{"id": 3, "v": 1.5}])
+        with self.raw_connect() as conn:
+            self.assertEqual(
+                conn.execute("SELECT v, typeof(v) FROM things ORDER BY id").fetchall(),
+                [(10, "integer"), ("11", "text"), (1.5, "real")],
+            )
+
+    def test_rebuild_with_new_columns_in_same_flush(self):
+        with self.raw_connect() as conn:
+            conn.execute("CREATE TABLE things (id INTEGER, v INTEGER)")
+            conn.execute("INSERT INTO things VALUES (1, 10)")
+        with BatchWriter("task", "things", ["id"], batch_size=100) as writer:
+            writer.add(0, [{"id": 2, "v": "x", "extra": "new"}])
+        with self.raw_connect() as conn:
+            self.assertEqual(
+                conn.execute("SELECT id, v, extra FROM things ORDER BY id").fetchall(),
+                [(1, 10, None), (2, "x", "new")],
+            )
+            self.assertEqual(
+                conn.execute("PRAGMA table_info(things)").fetchall()[2][2],
+                "BLOB",
+            )
+
+    def test_round_trip_survives_process_restart(self):
+        script = """
+            from scraperwiki.ingest import BatchWriter
+            writer = BatchWriter("task", "things", ["id"], batch_size=100)
+            writer.add(0, [{"id": 1, "code": 1234}])
+            writer.close()
+        """
+        self.run_in_subprocess(script)
+        script = """
+            from scraperwiki.ingest import BatchWriter
+            writer = BatchWriter("task", "things", ["id"], batch_size=100)
+            writer.add(1, [{"id": 2, "code": "01234"}])
+            writer.close()
+        """
+        self.run_in_subprocess(script)
+        with self.raw_connect() as conn:
+            self.assertEqual(
+                conn.execute(
+                    "SELECT code, typeof(code) FROM things ORDER BY id"
+                ).fetchall(),
+                [(1234, "integer"), ("01234", "text")],
+            )
+
+
+class TestUniqueKeyDeclaration(IngestTestCase):
+    def test_index_added_when_table_previously_had_no_key(self):
+        # Simulate the first-version scraper: a table created without a
+        # primary key, holding duplicate keys already.
+        with self.raw_connect() as conn:
+            conn.execute("CREATE TABLE things (id BLOB, v BLOB)")
+            conn.executemany(
+                "INSERT INTO things VALUES (?, ?)",
+                [(1, "old-a"), (1, "old-b"), (2, "old-c")],
+            )
+
+        # The new code declares the key when ingesting the next batch.
+        with BatchWriter("task", "things", ["id"], batch_size=100) as writer:
+            writer.add(0, [{"id": 3, "v": "new"}])
+
+        with self.raw_connect() as conn:
+            # Duplicate historical key collapses to its newest row.
+            self.assertEqual(
+                conn.execute("SELECT id, v FROM things ORDER BY rowid").fetchall(),
+                [(1, "old-b"), (2, "old-c"), (3, "new")],
+            )
+            indices = conn.execute("PRAGMA index_list(things)").fetchall()
+            self.assertTrue(
+                any(row[1] == "things_id_unique" and row[2] == 1 for row in indices),
+                indices,
+            )
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute("INSERT INTO things VALUES (3, 'dup')")
+
+    def test_key_declared_in_later_writer_after_keyless_writes(self):
+        with BatchWriter("task", "things", [], batch_size=100) as writer:
+            writer.add(0, [{"id": 1, "v": "a"}, {"id": 1, "v": "b"}])
+        with self.raw_connect() as conn:
+            self.assertEqual(conn.execute("PRAGMA index_list(things)").fetchall(), [])
+
+        with BatchWriter("task", "things", ["id"], batch_size=100) as writer:
+            writer.add(1, [{"id": 2, "v": "c"}])
+
+        with self.raw_connect() as conn:
+            indices = conn.execute("PRAGMA index_list(things)").fetchall()
+            self.assertTrue(
+                any(row[1] == "things_id_unique" and row[2] == 1 for row in indices),
+                indices,
+            )
+
+    def test_composite_unique_key(self):
+        with BatchWriter("task", "things", ["a", "b"], batch_size=100) as writer:
+            writer.add(
+                0,
+                [
+                    {"a": 1, "b": 1, "v": "first"},
+                    {"a": 1, "b": 2, "v": "other"},
+                    {"a": 1, "b": 1, "v": "second"},
+                ],
+            )
+        with self.raw_connect() as conn:
+            rows = conn.execute("SELECT a, b, v FROM things ORDER BY b").fetchall()
+        self.assertEqual(rows, [(1, 1, "second"), (1, 2, "other")])
+
+    def test_same_key_across_batches_last_write_wins(self):
+        with BatchWriter("task", "things", ["id"], batch_size=2) as writer:
+            writer.add(0, [{"id": 1, "v": "a"}, {"id": 2, "v": "b"}])
+            writer.add(1, [{"id": 1, "v": "c"}])
+            writer.add(2, [{"id": 1, "v": "d"}])
+        self.assertEqual(
+            self.raw_rows("things", order_by="id"),
+            [(1, "d"), (2, "b")],
+        )
+
+    def test_replaying_a_batch_creates_no_duplicates(self):
+        with BatchWriter("task", "things", ["id"], batch_size=100) as writer:
+            writer.add(0, [{"id": 1, "v": "a"}])
+            writer.add(1, [{"id": 2, "v": "b"}])
+        # New process re-emits an already-completed batch by number, then a
+        # fresh one that happens to reuse a key.
+        with BatchWriter("task", "things", ["id"], batch_size=100) as writer:
+            writer.add(0, [{"id": 1, "v": "stale"}])
+            writer.add(2, [{"id": 2, "v": "updated"}])
+        self.assertEqual(
+            self.raw_rows("things", order_by="id"),
+            [(1, "a"), (2, "updated")],
+        )
+
+
+class TestLegacyInterop(IngestTestCase):
+    def test_legacy_select_reads_writer_rows_with_storage_classes(self):
+        with BatchWriter("task", "things", ["id"], batch_size=100) as writer:
+            writer.add(0, [{"id": 1, "code": 1234}])
+            writer.add(1, [{"id": 2, "code": "01234"}])
+        rows = scraperwiki.sql.select("* FROM things ORDER BY id")
+        self.assertEqual(
+            rows,
+            [{"id": 1, "code": 1234}, {"id": 2, "code": "01234"}],
+        )
+
+    def test_legacy_save_writes_into_writer_table(self):
+        with BatchWriter("task", "things", ["id"], batch_size=100) as writer:
+            writer.add(0, [{"id": 1, "code": 1234}])
+        scraperwiki.sql.save(["id"], {"id": 2, "code": "01234"}, table_name="things")
+        self.assertEqual(
+            scraperwiki.sql.select("* FROM things ORDER BY id"),
+            [{"id": 1, "code": 1234}, {"id": 2, "code": "01234"}],
+        )
+
+    def test_writer_reads_table_built_by_legacy_save(self):
+        scraperwiki.sql.save(["id"], {"id": 1, "code": 1234}, table_name="things")
+        with BatchWriter("task", "things", ["id"], batch_size=100) as writer:
+            writer.add(0, [{"id": 2, "code": "01234"}])
+        self.assertEqual(
+            self.raw_rows("things", order_by="id"),
+            [(1, 1234), (2, "01234")],
+        )

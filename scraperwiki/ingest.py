@@ -91,6 +91,7 @@ class BatchWriter:
 
     def _load_checkpoint(self):
         """Read the persisted checkpoint for this task, if any."""
+        self._release_legacy_transaction()
         with self._engine.connect() as connection:
             if not sql.table_exists(connection, VARS_TABLE):
                 return -1
@@ -102,6 +103,20 @@ class BatchWriter:
         if row is None or row[0] is None:
             return -1
         return int(row[0])
+
+    def _release_legacy_transaction(self):
+        """
+        Commit any work held open by the shared legacy ``scraperwiki.sql``
+        connection.
+
+        The legacy module keeps a write transaction open between operations
+        (it only commits on a two-second timer), which would otherwise make
+        the writer block on a database lock that is never released in this
+        process.
+        """
+        state = sql._State
+        if state._connection is not None and state._transaction is not None:
+            state.new_transaction()
 
     def _ensure_vars_table(self, connection):
         """Make sure the variable store exists, with the legacy layout."""
@@ -166,6 +181,7 @@ class BatchWriter:
         self._pending = []
         self._pending_rows = 0
 
+        self._release_legacy_transaction()
         with self._engine.begin() as connection:
             self._adapt_schema(connection, batches)
             for batch_no, rows in batches:
@@ -246,14 +262,22 @@ class BatchWriter:
         """
         Make sure the data table exists and has a column for every field of
         every row about to be written.
+
+        Columns managed by the writer use BLOB (type-neutral) affinity: with
+        no affinity SQLite stores every value in its original storage class,
+        so an integer stays an integer and a string such as ``"01234"`` can
+        never be coerced into the number 1234.  A pre-existing column that
+        still carries a type affinity (typically a table first written by
+        the legacy ``sql.save``) triggers a one-off table rebuild so the
+        historical rows are preserved and new values round-trip exactly.
         """
         all_rows = [row for _, rows in batches for row in rows]
         wanted_columns = {}
         for row in all_rows:
             if not isinstance(row, Mapping):
                 continue
-            for name, value in row.items():
-                wanted_columns.setdefault(name, sql.affinity_for_value(value))
+            for name in row:
+                wanted_columns.setdefault(name, sql._BLOB_AFFINITY)
 
         if not sql.table_exists(connection, self.table):
             # A flush made up entirely of unwriteable rows has no columns
@@ -264,9 +288,23 @@ class BatchWriter:
             return
 
         current = sql.get_column_affinities(connection, self.table)
-        for name, affinity in wanted_columns.items():
+        needs_rebuild = any(
+            name in current and current[name] != sql._BLOB_AFFINITY
+            for name in wanted_columns
+        )
+        if needs_rebuild:
+            # Keep every existing column, all rebuilt as type-neutral, and
+            # add the new ones in the same pass.  SQLite recreates indexes
+            # attached to the table as part of the rebuild.
+            target = {name: sql._BLOB_AFFINITY for name in current}
+            for name in wanted_columns:
+                target.setdefault(name, sql._BLOB_AFFINITY)
+            sql.migrate_column_types(connection, self.table, target)
+            current = sql.get_column_affinities(connection, self.table)
+
+        for name in wanted_columns:
             if name not in current:
-                sql.add_data_column(connection, self.table, name, affinity)
+                sql.add_data_column(connection, self.table, name, sql._BLOB_AFFINITY)
         sql.ensure_unique_index(connection, self.table, self.unique_keys)
 
     def pending(self):

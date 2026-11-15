@@ -43,7 +43,31 @@ scraperwiki.sql.save(unique_keys, data[, table_name="swdata"])
   or until process exit. An effort is made to do a timely periodic flush.
   Records can be lost if the process experiences a hard-crash, power outage
   or SIGKILL due to high memory usage during an out-of-memory condition. The
-  buffer can be manually flushed with ``scraperwiki.sql.flush()``.
+  buffer can be manually flushed with ``scraperwiki.sql.flush()``, which
+  commits any buffered rows immediately.
+
+scraperwiki.ingest.BatchWriter(task, table, unique_keys, batch_size)
+  Batch ingestion channel for long-running scrapers. Rows are handed over a
+  batch at a time with ``add(batch_no, rows)`` and buffered in memory until
+  ``batch_size`` rows have accumulated (or ``flush()`` is called), at which
+  point whole batches are written in a single transaction. It supports the
+  context-manager protocol and exposes ``flush()``, ``pending()``,
+  ``stats()`` and ``close()``.
+
+  Progress is checkpointed per ``task`` in the same variable store used by
+  ``save_var``/``get_var`` (the highest completed batch number), so a writer
+  recreated after a restart resumes from the checkpoint and ``add`` skips
+  batches that are already done, counting them in the ``skipped`` stat.
+  Different tasks have independent checkpoints.
+
+  A row that cannot be written (for example one containing a nested
+  structure, or that is not a mapping) is skipped without affecting the rest
+  of its batch and recorded, together with the task, batch number, original
+  content and failure reason, in the fixed ``swquarantine`` table. Columns
+  are created and widened automatically: values keep their SQLite storage
+  class, so a string such as ``"01234"`` is always read back as ``"01234"``,
+  and type changes preserve historical rows via a table rebuild. Rows
+  sharing a unique key replace each other (last write wins) across batches.
 
 scraperwiki.sql.execute(sql[, vars])
   Executes any arbitrary SQL command. For example CREATE, DELETE, INSERT or DROP.

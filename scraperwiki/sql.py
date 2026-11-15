@@ -177,6 +177,26 @@ def select(query, data=None):
     return rows
 
 
+def _insert_raw(connection, table, row):
+    """
+    Insert a row using raw driver SQL.
+
+    Used when a column has type-neutral BLOB affinity (tables created by
+    ``scraperwiki.ingest.BatchWriter``) but the value is not bytes: the
+    SQLAlchemy LargeBinary bind processor would reject integers and strings
+    outright, whereas SQLite itself stores them in their original storage
+    class.
+    """
+    columns = list(row.keys())
+    column_sql = ", ".join(_quoted_identifier(column) for column in columns)
+    placeholders = ", ".join("?" for _ in columns)
+    connection.exec_driver_sql(
+        f"INSERT OR REPLACE INTO {_quoted_identifier(table.name)} "
+        f"({column_sql}) VALUES ({placeholders})",
+        tuple(row[column] for column in columns),
+    )
+
+
 def save(unique_keys, data, table_name="swdata"):
     """
     Save the given data to the table specified by `table_name`
@@ -200,7 +220,18 @@ def save(unique_keys, data, table_name="swdata"):
         if not isinstance(row, Mapping):
             raise TypeError(f"Elements of data must be mappings, got {type(row)}")
         fit_row(connection, row, unique_keys)
-        connection.execute(insert.values(row))
+        # Type-neutral (BLOB affinity) columns accept any storage class, but
+        # SQLAlchemy's bind processor only accepts bytes; use raw binds for
+        # such rows so integers and strings round-trip unchanged.
+        if any(
+            isinstance(_State.table.columns[key].type, sqlalchemy.LargeBinary)
+            and not isinstance(row[key], (bytes, bytearray, memoryview))
+            for key in row
+            if key in _State.table.columns
+        ):
+            _insert_raw(connection, _State.table, row)
+        else:
+            connection.execute(insert.values(row))
     _State.check_last_committed()
 
 
@@ -543,7 +574,10 @@ def migrate_column_types(connection, table_name, target_affinities):
     12-step table rebuild is used: rename the old table, create the new one
     with the target affinities, copy the data across and drop the old table.
     Columns made type-neutral use BLOB affinity, which keeps previously
-    stored values (integers, strings, ...) byte-for-byte intact.
+    stored values (integers, strings, ...) byte-for-byte intact.  Columns in
+    ``target_affinities`` that the old table does not have are created empty
+    rather than selected, since an unresolvable quoted name in a SELECT is
+    treated by SQLite as a string literal instead of raising an error.
     """
     old_name = f"{table_name}_sw_type_old"
     suffix = 0
@@ -559,35 +593,35 @@ def migrate_column_types(connection, table_name, target_affinities):
         _column_declaration(name, affinity)
         for name, affinity in target_affinities.items()
     )
-    column_list = ", ".join(_quoted_identifier(name) for name in target_affinities)
     connection.exec_driver_sql(f"CREATE TABLE {quoted_table} ({declarations})")
-    connection.exec_driver_sql(
-        f"INSERT INTO {quoted_table} ({column_list}) "
-        f"SELECT {column_list} FROM {quoted_old}"
-    )
+
+    old_columns = set(get_column_affinities(connection, old_name))
+    copied = [name for name in target_affinities if name in old_columns]
+    if copied:
+        column_list = ", ".join(_quoted_identifier(name) for name in copied)
+        connection.exec_driver_sql(
+            f"INSERT INTO {quoted_table} ({column_list}) "
+            f"SELECT {column_list} FROM {quoted_old}"
+        )
     connection.exec_driver_sql(f"DROP TABLE {quoted_old}")
-
-
-def affinity_for_value(value):
-    """
-    SQLite storage affinity to declare for a column holding ``value``.
-
-    Matches the legacy ``get_column_type`` mapping: integers get an INTEGER
-    column, everything non-numeric falls back to text-like storage.
-    """
-    if isinstance(value, bool):
-        return _BLOB_AFFINITY
-    if isinstance(value, int):
-        return "INTEGER"
-    if isinstance(value, float):
-        return "REAL"
-    if isinstance(value, (bytes, Blob)):
-        return _BLOB_AFFINITY
-    return _TEXT_AFFINITY
 
 
 def commit():
     warnings.warn("scraperwiki.sql.commit is now a no-op")
+
+
+def flush():
+    """
+    Commit any rows buffered by :func:`save` immediately.
+
+    Rows are normally committed on a short timer; this makes the commit
+    happen on demand without changing what :func:`save` writes.
+    """
+    if _State._connection is not None and _State._transaction is not None:
+        _State.new_transaction()
+    else:
+        # Establishing the connection also starts a fresh transaction.
+        _State.connection()
 
 
 def drop():
