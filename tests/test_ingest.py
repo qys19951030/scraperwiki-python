@@ -197,23 +197,6 @@ class TestBatchPersistence(IngestTestCase):
             writer.flush()
         self.assertEqual(self.raw_rows("things"), [(1,), (2,), (3,)])
 
-    def test_non_mapping_row_raises(self):
-        # Quarantine handling arrives in a later commit; for now a bad row
-        # aborts the flush and leaves nothing from that flush behind.
-        writer = BatchWriter("task", "things", ["id"], batch_size=100)
-        writer.add(0, [{"id": 1}, ["not", "a", "dict"], {"id": 2}])
-        with self.assertRaises(TypeError):
-            writer.flush()
-        with self.raw_connect() as conn:
-            self.assertEqual(
-                conn.execute(
-                    'SELECT name FROM sqlite_master WHERE type="table" '
-                    'AND name="things"'
-                ).fetchall(),
-                [],
-            )
-        writer.close()
-
     def test_separate_sqlite_connection_sees_committed_rows(self):
         with BatchWriter("task", "things", ["id"], batch_size=100) as writer:
             writer.add(0, [{"id": 1, "v": "x"}])
@@ -314,12 +297,20 @@ class TestCheckpoints(IngestTestCase):
         recreated.close()
 
     def test_checkpoint_and_rows_commit_atomically(self):
-        # A flush that fails must leave neither rows nor a checkpoint
-        # behind, so a retry after restart does not skip a missing batch.
+        # A flush that fails after rows were written must roll back rows,
+        # quarantine records, DDL and the checkpoint together, so a retry
+        # after restart does not skip a missing batch.
         writer = BatchWriter("task", "things", ["id"], batch_size=100)
         writer.add(0, [{"id": 1}, ["bad", "row"]])
-        with self.assertRaises(TypeError):
+        original = writer._save_checkpoint
+
+        def failing_checkpoint(connection, batch_no):
+            raise RuntimeError("simulated crash after row writes")
+
+        writer._save_checkpoint = failing_checkpoint
+        with self.assertRaises(RuntimeError):
             writer.flush()
+        writer._save_checkpoint = original
         writer.close()
 
         restarted = BatchWriter("task", "things", ["id"], batch_size=100)
@@ -333,3 +324,70 @@ class TestCheckpoints(IngestTestCase):
                 [],
             )
         restarted.close()
+
+
+class TestQuarantine(IngestTestCase):
+    def quarantine_rows(self):
+        with self.raw_connect() as conn:
+            return conn.execute(
+                "SELECT task, batch_no, row_content, reason "
+                "FROM swquarantine ORDER BY id"
+            ).fetchall()
+
+    def test_non_mapping_row_is_quarantined(self):
+        with BatchWriter("task", "things", ["id"], batch_size=100) as writer:
+            writer.add(3, [{"id": 1}, ["not", "a", "dict"], {"id": 2}])
+        self.assertEqual(self.raw_rows("things"), [(1,), (2,)])
+        (quarantined,) = self.quarantine_rows()
+        task, batch_no, row_content, reason = quarantined
+        self.assertEqual(task, "task")
+        self.assertEqual(batch_no, 3)
+        self.assertEqual(row_content, '["not", "a", "dict"]')
+        self.assertIn("TypeError", reason)
+        self.assertEqual(
+            writer.stats(),
+            {"success": 2, "failure": 1, "skipped": 0},
+        )
+
+    def test_nested_structure_row_is_quarantined(self):
+        with BatchWriter("task", "things", ["id"], batch_size=100) as writer:
+            writer.add(0, [{"id": 1, "payload": {"nested": "dict"}}])
+        self.assertEqual(self.raw_rows("things"), [])
+        (quarantined,) = self.quarantine_rows()
+        self.assertEqual(quarantined[1], 0)
+        self.assertIn('{"nested": "dict"}', quarantined[2])
+        self.assertIn("Error", quarantined[3])
+        self.assertEqual(writer.stats()["failure"], 1)
+
+    def test_bad_rows_do_not_block_other_batches(self):
+        with BatchWriter("task", "things", ["id"], batch_size=100) as writer:
+            writer.add(0, [{"id": 1}, object()])
+            writer.add(1, [{"id": 2}, {"id": 3}])
+        self.assertEqual(self.raw_rows("things"), [(1,), (2,), (3,)])
+        self.assertEqual(len(self.quarantine_rows()), 1)
+        self.assertEqual(writer.checkpoint, 1)
+        self.assertEqual(
+            writer.stats(),
+            {"success": 3, "failure": 1, "skipped": 0},
+        )
+
+    def test_batch_with_bad_rows_still_checkpoints(self):
+        with BatchWriter("task", "things", ["id"], batch_size=100) as writer:
+            writer.add(5, [{"id": 1}, "bad"])
+        self.assertEqual(writer.checkpoint, 5)
+
+        restarted = BatchWriter("task", "things", ["id"], batch_size=100)
+        restarted.add(5, [{"id": 1}, "bad"])
+        restarted.close()
+        # Replaying the completed batch skips it entirely: the bad row is
+        # not quarantined a second time.
+        self.assertEqual(restarted.stats()["skipped"], 2)
+        self.assertEqual(len(self.quarantine_rows()), 1)
+
+    def test_quarantine_isolated_per_writer_task(self):
+        with BatchWriter("task-a", "things", ["id"], batch_size=100) as writer:
+            writer.add(0, ["bad-a"])
+        with BatchWriter("task-b", "things", ["id"], batch_size=100) as writer:
+            writer.add(0, ["bad-b"])
+        rows = self.quarantine_rows()
+        self.assertEqual([row[0] for row in rows], ["task-a", "task-b"])

@@ -12,12 +12,19 @@ the batch.
 Only SQLite is supported and no new runtime dependencies are required.
 """
 
+import json
 from collections.abc import Mapping
+
+import sqlalchemy
 
 from . import sql
 
 # Table holding rows that could not be written together with the reason.
 QUARANTINE_TABLE = "swquarantine"
+
+# Row-writing failures that should isolate the offending row rather than
+# abort the whole flush: bad row shapes and database-level write errors.
+ROW_WRITE_ERRORS = (TypeError, sqlalchemy.exc.SQLAlchemyError)
 
 # Checkpoints live in the existing scraperwiki variable store (the same
 # table used by sql.save_var / sql.get_var), namespaced per task.
@@ -164,29 +171,76 @@ class BatchWriter:
             for batch_no, rows in batches:
                 written = self._write_batch(connection, batch_no, rows)
                 self._stats["success"] += written
-                # The whole batch is now safely stored: advance the
-                # checkpoint inside the same transaction so a crash either
-                # commits both the rows and the progress marker or neither.
+                # The whole batch is now accounted for (stored or
+                # quarantined): advance the checkpoint inside the same
+                # transaction so a crash either commits both the rows and
+                # the progress marker or neither.
                 self._save_checkpoint(connection, batch_no)
 
     def _write_batch(self, connection, batch_no, rows):
-        """Write one batch, returning the number of rows stored."""
+        """
+        Write one batch, returning the number of rows stored.
+
+        Each row runs inside its own savepoint, so a row that cannot be
+        written is rolled back and moved to the quarantine table without
+        affecting the other rows of the batch.
+        """
         quoted_table = sql._quoted_identifier(self.table)
         insert_sql = f"INSERT OR REPLACE INTO {quoted_table} "
         written = 0
         for row in rows:
-            if not isinstance(row, Mapping):
-                raise TypeError(f"Elements of data must be mappings, got {type(row)}")
-            columns = list(row.keys())
-            column_sql = ", ".join(sql._quoted_identifier(column) for column in columns)
-            placeholders = ", ".join("?" for _ in columns)
-            values = [row[column] for column in columns]
-            connection.exec_driver_sql(
-                insert_sql + f"({column_sql}) VALUES ({placeholders})",
-                tuple(values),
-            )
-            written += 1
+            try:
+                with connection.begin_nested():
+                    if not isinstance(row, Mapping):
+                        raise TypeError(
+                            "Elements of data must be mappings, got "
+                            f"{type(row).__name__}"
+                        )
+                    columns = list(row.keys())
+                    column_sql = ", ".join(
+                        sql._quoted_identifier(column) for column in columns
+                    )
+                    placeholders = ", ".join("?" for _ in columns)
+                    values = [row[column] for column in columns]
+                    connection.exec_driver_sql(
+                        insert_sql + f"({column_sql}) VALUES ({placeholders})",
+                        tuple(values),
+                    )
+            except ROW_WRITE_ERRORS as exc:
+                self._quarantine(connection, batch_no, row, exc)
+                self._stats["failure"] += 1
+            else:
+                written += 1
         return written
+
+    def _serialize_row(self, row):
+        """Render an arbitrary row object as text for the quarantine table."""
+        try:
+            return json.dumps(row, ensure_ascii=False, default=repr)
+        except TypeError:
+            return repr(row)
+
+    def _ensure_quarantine_table(self, connection):
+        """Create the fixed quarantine table on first use."""
+        if not sql.table_exists(connection, QUARANTINE_TABLE):
+            connection.exec_driver_sql(
+                f"CREATE TABLE {sql._quoted_identifier(QUARANTINE_TABLE)} ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "task TEXT NOT NULL, "
+                "batch_no INTEGER NOT NULL, "
+                "row_content TEXT NOT NULL, "
+                "reason TEXT NOT NULL)"
+            )
+
+    def _quarantine(self, connection, batch_no, row, exc):
+        """Record an unwritable row and the reason it failed."""
+        self._ensure_quarantine_table(connection)
+        reason = f"{type(exc).__name__}: {exc}"
+        connection.exec_driver_sql(
+            f"INSERT INTO {sql._quoted_identifier(QUARANTINE_TABLE)} "
+            "(task, batch_no, row_content, reason) VALUES (?, ?, ?, ?)",
+            (self.task, batch_no, self._serialize_row(row), reason),
+        )
 
     def _adapt_schema(self, connection, batches):
         """
@@ -202,8 +256,11 @@ class BatchWriter:
                 wanted_columns.setdefault(name, sql.affinity_for_value(value))
 
         if not sql.table_exists(connection, self.table):
-            sql.create_data_table(connection, self.table, wanted_columns)
-            sql.ensure_unique_index(connection, self.table, self.unique_keys)
+            # A flush made up entirely of unwriteable rows has no columns
+            # to create; wait for a valid row before creating the table.
+            if wanted_columns:
+                sql.create_data_table(connection, self.table, wanted_columns)
+                sql.ensure_unique_index(connection, self.table, self.unique_keys)
             return
 
         current = sql.get_column_affinities(connection, self.table)
