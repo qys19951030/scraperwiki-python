@@ -3,14 +3,21 @@ Batch ingestion for long-running scrapers.
 
 ``scraperwiki.sql.save`` writes one row at a time and keeps scraper state in
 memory, which does not survive a process being killed and makes partial
-failures hard to account for.  ``BatchWriter`` instead takes data a batch at a
-time, writes whole batches to SQLite in one transaction, records progress in
+failures hard to account for.  ``BatchWriter`` instead takes data a batch at
+a time, writes whole batches to SQLite in one transaction, records progress in
 the database so a restart resumes where the previous run stopped, and routes
 rows that cannot be written to a fixed quarantine table instead of aborting
 the batch.
 
 Only SQLite is supported and no new runtime dependencies are required.
 """
+
+from collections.abc import Mapping
+
+from . import sql
+
+# Table holding rows that could not be written together with the reason.
+QUARANTINE_TABLE = "swquarantine"
 
 
 class BatchWriter:
@@ -54,6 +61,10 @@ class BatchWriter:
         self._pending_rows = 0
         self._closed = False
 
+        # Dedicated engine/metadata so the writer never disturbs the global
+        # connection state used by the legacy scraperwiki.sql functions.
+        self._engine = sql._engine_for()
+
         # Cumulative counters for the lifetime of this writer.
         self._stats = {"success": 0, "failure": 0, "skipped": 0}
 
@@ -82,16 +93,69 @@ class BatchWriter:
 
     def flush(self):
         """
-        Write every buffered batch to the database.
+        Write every buffered batch to the database in a single transaction.
 
-        The concrete persistence logic (batch writes, checkpoints, quarantine
-        and schema adaptation) is added in later iterations; the skeleton only
-        drains the in-memory buffer.
+        On return every row passed to :meth:`add` since the previous flush is
+        either stored in the data table or rejected to the quarantine table,
+        and the progress checkpoint has advanced.
         """
         if self._closed:
             raise RuntimeError("BatchWriter is closed")
-        self._pending.clear()
+        if not self._pending:
+            return
+
+        batches = self._pending
+        self._pending = []
         self._pending_rows = 0
+
+        with self._engine.begin() as connection:
+            self._adapt_schema(connection, batches)
+            for batch_no, rows in batches:
+                written = self._write_batch(connection, batch_no, rows)
+                self._stats["success"] += written
+
+    def _write_batch(self, connection, batch_no, rows):
+        """Write one batch, returning the number of rows stored."""
+        quoted_table = sql._quoted_identifier(self.table)
+        insert_sql = f"INSERT OR REPLACE INTO {quoted_table} "
+        written = 0
+        for row in rows:
+            if not isinstance(row, Mapping):
+                raise TypeError(f"Elements of data must be mappings, got {type(row)}")
+            columns = list(row.keys())
+            column_sql = ", ".join(sql._quoted_identifier(column) for column in columns)
+            placeholders = ", ".join("?" for _ in columns)
+            values = [row[column] for column in columns]
+            connection.exec_driver_sql(
+                insert_sql + f"({column_sql}) VALUES ({placeholders})",
+                tuple(values),
+            )
+            written += 1
+        return written
+
+    def _adapt_schema(self, connection, batches):
+        """
+        Make sure the data table exists and has a column for every field of
+        every row about to be written.
+        """
+        all_rows = [row for _, rows in batches for row in rows]
+        wanted_columns = {}
+        for row in all_rows:
+            if not isinstance(row, Mapping):
+                continue
+            for name, value in row.items():
+                wanted_columns.setdefault(name, sql.affinity_for_value(value))
+
+        if not sql.table_exists(connection, self.table):
+            sql.create_data_table(connection, self.table, wanted_columns)
+            sql.ensure_unique_index(connection, self.table, self.unique_keys)
+            return
+
+        current = sql.get_column_affinities(connection, self.table)
+        for name, affinity in wanted_columns.items():
+            if name not in current:
+                sql.add_data_column(connection, self.table, name, affinity)
+        sql.ensure_unique_index(connection, self.table, self.unique_keys)
 
     def pending(self):
         """Number of rows held in memory but not yet written to the database."""
@@ -106,10 +170,11 @@ class BatchWriter:
         return dict(self._stats)
 
     def close(self):
-        """Flush any remaining rows and mark the writer as closed."""
+        """Flush any remaining rows and release database resources."""
         if self._closed:
             return
         self.flush()
+        self._engine.dispose()
         self._closed = True
 
     def __enter__(self):
@@ -124,7 +189,7 @@ class BatchWriter:
         """
         Highest batch number known to be fully written to the database.
 
-        ``-1`` means nothing has been written yet.  The skeleton has no
-        database behind it, so it always reports ``-1``.
+        ``-1`` means nothing has been written yet.  Persistent checkpoints
+        are added in a later iteration.
         """
         return -1

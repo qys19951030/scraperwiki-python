@@ -384,6 +384,203 @@ def get_column_type(column_value):
     return PYTHON_SQLITE_TYPE_MAP.get(type(column_value), sqlalchemy.types.Text)
 
 
+# ---------------------------------------------------------------------------
+# Schema helpers used by scraperwiki.ingest
+#
+# Unlike the legacy save() path these helpers talk to the database with raw
+# driver SQL.  Values are bound directly by pysqlite so that, once a column
+# has been made type-neutral (BLOB affinity), an integer stays an integer and
+# a string such as "01234" is read back verbatim instead of being coerced.
+# ---------------------------------------------------------------------------
+
+# Names of the SQLite storage affinities used when a column is created or
+# rebuilt.  BLOB columns have no type affinity, which is what lets a single
+# column store integers and strings side by side without coercion.
+_TEXT_AFFINITY = "TEXT"
+_BLOB_AFFINITY = "BLOB"
+
+
+def _quoted_identifier(identifier):
+    """Quote a table or column name for safe inclusion in raw SQL."""
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def _engine_for(db_path=None):
+    """
+    Create a standalone engine for the batch ingestion path.
+
+    pysqlite opens an implicit transaction only for DML and silently commits
+    before DDL, which would make CREATE/ALTER TABLE escape the writer's
+    flush transaction.  Setting ``isolation_level = None`` and emitting
+    ``BEGIN`` ourselves (the documented SQLAlchemy recipe) makes DDL
+    transactional so a failed flush rolls back completely, including schema
+    changes.
+    """
+    if db_path is None:
+        db_path = _State.db_path
+    engine = sqlalchemy.create_engine(
+        db_path, echo=False, connect_args={"timeout": DATABASE_TIMEOUT}
+    )
+
+    @sqlalchemy.event.listens_for(engine, "connect")
+    def _set_isolation_level(dbapi_connection, _connection_record):
+        dbapi_connection.isolation_level = None
+
+    @sqlalchemy.event.listens_for(engine, "begin")
+    def _emit_begin(connection):
+        connection.exec_driver_sql("BEGIN")
+
+    return engine
+
+
+def table_exists(connection, table_name):
+    """Return whether a table of this name exists."""
+    row = connection.exec_driver_sql(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
+def get_column_affinities(connection, table_name):
+    """
+    Return ``{column_name: declared_affinity}`` for an existing table.
+
+    The affinity is the uppercase type name recorded by ``PRAGMA
+    table_info`` (e.g. ``"INTEGER"``, ``"TEXT"``, ``"BLOB"``).
+    """
+    rows = connection.exec_driver_sql(
+        f"PRAGMA table_info({_quoted_identifier(table_name)})"
+    ).fetchall()
+    return {row[1]: (row[2].upper() if row[2] else _BLOB_AFFINITY) for row in rows}
+
+
+def _column_declaration(column_name, affinity):
+    return f"{_quoted_identifier(column_name)} {affinity}"
+
+
+def create_data_table(connection, table_name, columns):
+    """
+    Create a data table with the given ``{column_name: affinity}`` mapping.
+    """
+    declarations = ", ".join(
+        _column_declaration(name, affinity) for name, affinity in columns.items()
+    )
+    connection.exec_driver_sql(
+        f"CREATE TABLE {_quoted_identifier(table_name)} ({declarations})"
+    )
+
+
+def add_data_column(connection, table_name, column_name, affinity):
+    """Add a new column to an existing data table."""
+    connection.exec_driver_sql(
+        f"ALTER TABLE {_quoted_identifier(table_name)} "
+        f"ADD COLUMN {_column_declaration(column_name, affinity)}"
+    )
+
+
+def _existing_index_names(connection, table_name):
+    rows = connection.exec_driver_sql(
+        f"PRAGMA index_list({_quoted_identifier(table_name)})"
+    ).fetchall()
+    return {row[1] for row in rows}
+
+
+def unique_index_name(table_name, column_names):
+    """Deterministic name for the unique index backing ``unique_keys``."""
+    cleaned_table = re.sub(r"[^a-zA-Z0-9]", "", table_name)
+    cleaned_columns = "_".join(
+        re.sub(r"[^a-zA-Z0-9]", "", name) for name in column_names
+    )
+    return f"{cleaned_table}_{cleaned_columns}_unique"
+
+
+def ensure_unique_index(connection, table_name, column_names):
+    """
+    Make sure a unique index on ``column_names`` exists for the table.
+
+    Existing duplicate rows are removed first (the row with the highest
+    rowid wins, i.e. the most recently written row), so the index can always
+    be created.  This covers tables that were originally created without a
+    primary key and only later gain a unique-key declaration.
+    """
+    if not column_names:
+        return
+    index_name = unique_index_name(table_name, column_names)
+    if index_name in _existing_index_names(connection, table_name):
+        return
+
+    quoted_index = _quoted_identifier(index_name)
+    quoted_table = _quoted_identifier(table_name)
+    quoted_columns = ", ".join(_quoted_identifier(name) for name in column_names)
+    try:
+        connection.exec_driver_sql(
+            f"CREATE UNIQUE INDEX {quoted_index} ON {quoted_table} ({quoted_columns})"
+        )
+    except sqlalchemy.exc.IntegrityError:
+        # Duplicate keys already present in unindexed historical data: keep
+        # the newest row for each key, then retry.
+        key_select = ", ".join(_quoted_identifier(name) for name in column_names)
+        connection.exec_driver_sql(
+            f"DELETE FROM {quoted_table} WHERE rowid NOT IN "
+            f"(SELECT max(rowid) FROM {quoted_table} GROUP BY {key_select})"
+        )
+        connection.exec_driver_sql(
+            f"CREATE UNIQUE INDEX {quoted_index} ON {quoted_table} ({quoted_columns})"
+        )
+
+
+def migrate_column_types(connection, table_name, target_affinities):
+    """
+    Rebuild a table so each column has the requested declared affinity.
+
+    SQLite cannot alter the type of an existing column, so the standard
+    12-step table rebuild is used: rename the old table, create the new one
+    with the target affinities, copy the data across and drop the old table.
+    Columns made type-neutral use BLOB affinity, which keeps previously
+    stored values (integers, strings, ...) byte-for-byte intact.
+    """
+    old_name = f"{table_name}_sw_type_old"
+    suffix = 0
+    while table_exists(connection, old_name):
+        suffix += 1
+        old_name = f"{table_name}_sw_type_old_{suffix}"
+
+    quoted_table = _quoted_identifier(table_name)
+    quoted_old = _quoted_identifier(old_name)
+    connection.exec_driver_sql(f"ALTER TABLE {quoted_table} RENAME TO {quoted_old}")
+
+    declarations = ", ".join(
+        _column_declaration(name, affinity)
+        for name, affinity in target_affinities.items()
+    )
+    column_list = ", ".join(_quoted_identifier(name) for name in target_affinities)
+    connection.exec_driver_sql(f"CREATE TABLE {quoted_table} ({declarations})")
+    connection.exec_driver_sql(
+        f"INSERT INTO {quoted_table} ({column_list}) "
+        f"SELECT {column_list} FROM {quoted_old}"
+    )
+    connection.exec_driver_sql(f"DROP TABLE {quoted_old}")
+
+
+def affinity_for_value(value):
+    """
+    SQLite storage affinity to declare for a column holding ``value``.
+
+    Matches the legacy ``get_column_type`` mapping: integers get an INTEGER
+    column, everything non-numeric falls back to text-like storage.
+    """
+    if isinstance(value, bool):
+        return _BLOB_AFFINITY
+    if isinstance(value, int):
+        return "INTEGER"
+    if isinstance(value, float):
+        return "REAL"
+    if isinstance(value, (bytes, Blob)):
+        return _BLOB_AFFINITY
+    return _TEXT_AFFINITY
+
+
 def commit():
     warnings.warn("scraperwiki.sql.commit is now a no-op")
 

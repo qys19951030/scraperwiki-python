@@ -123,3 +123,102 @@ class TestBatchWriterShell(IngestTestCase):
         stats = writer.stats()
         stats["success"] = 999
         self.assertEqual(writer.stats()["success"], 0)
+
+
+class TestBatchPersistence(IngestTestCase):
+    def test_manual_flush_writes_rows(self):
+        writer = BatchWriter("task", "things", ["id"], batch_size=100)
+        writer.add(0, [{"id": 1, "name": "a"}, {"id": 2, "name": "b"}])
+        # Still buffered: a separate connection must not see anything yet.
+        with self.raw_connect() as conn:
+            self.assertEqual(
+                conn.execute(
+                    'SELECT name FROM sqlite_master WHERE type="table" '
+                    'AND name="things"'
+                ).fetchall(),
+                [],
+            )
+        writer.flush()
+        self.assertEqual(
+            self.raw_rows("things"),
+            [(1, "a"), (2, "b")],
+        )
+        self.assertEqual(writer.stats()["success"], 2)
+        writer.close()
+
+    def test_auto_flush_at_batch_size_persists(self):
+        writer = BatchWriter("task", "things", ["id"], batch_size=3)
+        writer.add(0, [{"id": 1}, {"id": 2}])
+        writer.add(1, [{"id": 3}])
+        self.assertEqual(writer.pending(), 0)
+        self.assertEqual(self.raw_rows("things"), [(1,), (2,), (3,)])
+        writer.close()
+
+    def test_context_manager_flushes_on_exit(self):
+        with BatchWriter("task", "things", ["id"], batch_size=100) as writer:
+            writer.add(0, [{"id": 1}, {"id": 2}])
+        self.assertEqual(self.raw_rows("things"), [(1,), (2,)])
+
+    def test_new_columns_are_added(self):
+        writer = BatchWriter("task", "things", ["id"], batch_size=100)
+        writer.add(0, [{"id": 1, "a": "x"}])
+        writer.flush()
+        writer.add(1, [{"id": 2, "a": "y", "b": 42}])
+        writer.flush()
+        with self.raw_connect() as conn:
+            self.assertEqual(
+                conn.execute("SELECT id, a, b FROM things ORDER BY id").fetchall(),
+                [(1, "x", None), (2, "y", 42)],
+            )
+        writer.close()
+
+    def test_unique_index_is_created(self):
+        with BatchWriter("task", "things", ["id"], batch_size=100) as writer:
+            writer.add(0, [{"id": 1, "v": "a"}])
+        with self.raw_connect() as conn:
+            indices = conn.execute("PRAGMA index_list(things)").fetchall()
+        self.assertTrue(
+            any(row[1] == "things_id_unique" and row[2] == 1 for row in indices),
+            indices,
+        )
+
+    def test_same_primary_key_replaces_row(self):
+        with BatchWriter("task", "things", ["id"], batch_size=100) as writer:
+            writer.add(0, [{"id": 1, "v": "first"}])
+            writer.flush()
+            writer.add(1, [{"id": 1, "v": "second"}])
+        self.assertEqual(self.raw_rows("things"), [(1, "second")])
+
+    def test_multiple_batches_one_transaction(self):
+        with BatchWriter("task", "things", ["id"], batch_size=2) as writer:
+            writer.add(0, [{"id": 1}, {"id": 2}])
+            self.assertEqual(self.raw_rows("things"), [(1,), (2,)])
+            writer.add(1, [{"id": 3}])
+            writer.flush()
+        self.assertEqual(self.raw_rows("things"), [(1,), (2,), (3,)])
+
+    def test_non_mapping_row_raises(self):
+        # Quarantine handling arrives in a later commit; for now a bad row
+        # aborts the flush and leaves nothing from that flush behind.
+        writer = BatchWriter("task", "things", ["id"], batch_size=100)
+        writer.add(0, [{"id": 1}, ["not", "a", "dict"], {"id": 2}])
+        with self.assertRaises(TypeError):
+            writer.flush()
+        with self.raw_connect() as conn:
+            self.assertEqual(
+                conn.execute(
+                    'SELECT name FROM sqlite_master WHERE type="table" '
+                    'AND name="things"'
+                ).fetchall(),
+                [],
+            )
+        writer.close()
+
+    def test_separate_sqlite_connection_sees_committed_rows(self):
+        with BatchWriter("task", "things", ["id"], batch_size=100) as writer:
+            writer.add(0, [{"id": 1, "v": "x"}])
+            writer.flush()
+        with self.raw_connect() as conn:
+            self.assertEqual(
+                conn.execute("SELECT id, v FROM things").fetchall(), [(1, "x")]
+            )
